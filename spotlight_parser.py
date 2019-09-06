@@ -1,7 +1,5 @@
 # Parse the Spotlight store.db file from mac OSX
 #
-# Parse the Spotlight store.db file from mac OSX
-#
 #  (c) Yogesh Khatri - 2018 www.swiftforensics.com
 #
 # This program is free software: you can redistribute it and/or modify
