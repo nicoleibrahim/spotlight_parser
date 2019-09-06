@@ -1,5 +1,7 @@
 # Parse the Spotlight store.db file from mac OSX
 #
+# Parse the Spotlight store.db file from mac OSX
+#
 #  (c) Yogesh Khatri - 2018 www.swiftforensics.com
 #
 # This program is free software: you can redistribute it and/or modify
@@ -38,6 +40,7 @@
 
 from __future__ import print_function
 
+import struct
 import zlib
 import lz4.block
 import time
@@ -47,9 +50,10 @@ import datetime
 import os
 import sys
 import logging
+import sqlite3
 from enum import IntEnum
 
-__VERSION__ = '0.8'
+__VERSION__ = '0.8.1'
 
 log = logging.getLogger('SPOTLIGHT_PARSER')
 
@@ -74,7 +78,7 @@ class FileMetaDataListing:
             return "{:.1f}".format(num)
         else:
             return "{:.12g}".format(num)
-       
+
     def ReadFloat(self):
         num = struct.unpack("<f", self.data[self.pos : self.pos + 4])[0]
         self.pos += 4
@@ -193,17 +197,32 @@ class FileMetaDataListing:
             v = v.decode('utf-8')
         return v
 
-    def Print(self, file):
+    def Print(self, file, db_used = None, db_columns = None, db_values = None, db_columns_new = None):
         try:
             dashed_line = "-"*60
             info = u"Inode_Num --> {}\r\nFlags --> {}\r\nStore_ID --> {}\r\nParent_Inode_Num --> {}\r\nLast_Updated --> {}\r\n".format(self.id, self.flags, self.item_id, self.parent_id, self.ConvertEpochToUtcDateStr(self.date_updated))
-
+            if db_used != None:
+#                db_columns_new = db_columns_add
+                db_columns = ["full_path", "Inode_Num", "Flags", "Store_ID", "Parent_Inode_Num", "Last_Updated"]
+                db_values = ["", self.id, self.flags, self.item_id, self.parent_id, self.ConvertEpochToUtcDateStr(self.date_updated)]
+            
             file.write((dashed_line + '\r\n' + info).encode('utf-8'))
             for k, v in sorted(self.meta_data_dict.items()):
                 orig_debug = v
                 v = self.StringifyValue(v)
                 file.write((k + u" --> " + v).encode('utf-8'))
                 file.write(b'\r\n')
+                
+                if db_used != None:
+                    if unicode(k) not in db_columns:
+                        db_columns.append(unicode(k))
+                        db_values.append(unicode(v).encode('utf-8'))
+                    if unicode(k) not in db_columns_new:
+                        db_columns_new.append(unicode(k))
+                        
+                file.write((k + u" --> " + v).encode('utf-8'))
+                file.write(b'\r\n')
+            return db_columns, db_values, db_columns_new
         except Exception as ex:
             log.exception("Exception trying to print data : ")
 
@@ -412,6 +431,129 @@ class StoreBlock:
         self.unknown1 = struct.unpack("<I", data[24:28])[0]
         self.unknown2 = struct.unpack("<I", data[28:32])[0]
 
+class SQLiteDb:
+    def __init__(self, file_pointer):
+        self.db_file = file_pointer
+        self.CreateDatabase(self.db_file)
+        
+    def CreateDatabase(self, databaseFile):
+
+        self.con = sqlite3.connect(databaseFile)
+        self.con.text_factory = lambda x :unicode(x, 'utf-8', 'ignore')
+        # Create the table
+        self.con.execute("Pragma journal_mode=OFF")
+        self.con.execute(
+            "CREATE TABLE IF NOT EXISTS spotlight_data(full_path text, Inode_Num int, flags int, store_id int, parent_inode_Num int, last_updated text)")
+        self.con.execute("CREATE INDEX inode_index ON spotlight_data(Inode_Num)");
+        self.SQLTran = self.con.cursor()
+
+    def Close(self):
+  
+        # We need to run commit or not all data is stored in the database.
+        self.con.commit()
+        self.con.close()
+    
+    def CreateBindVariables(self, number_of_columns):
+  
+        bind_variables = " ?"
+        for i in range(1, number_of_columns):
+           bind_variables = bind_variables + ", ?"
+        #bind_variables = bind_variables + ")"       
+        return bind_variables
+  
+    def AddColumn(self, sql_statement, column_name):
+
+        try:
+            self.con.execute(sql_statement)    
+        except Exception as ex:
+            print ('Error adding column to table ==> ' + column_name)
+    
+    def InsertValues(self, column_definitions, column_values, num_columns):
+    
+        column_bind_values = self.CreateBindVariables(num_columns)
+
+        sql_query = u'insert into spotlight_data ( {0:s} ) values ( {1:s} )'.format(column_definitions, column_bind_values)
+
+        #print (sql_query)
+    
+        try:
+            self.con.execute(sql_query, column_values)
+        except Exception as ex:
+            print ("Excpetion is ==> " + str(ex))
+            print ("Error loading data into table " + str(sql_query) + " " + str(column_values))
+            
+    def UpdateFullpaths(self, query):
+        self.SQLTran.execute(query)
+        
+    def GetTableColumnNames(self):
+        cursor = self.SQLTran.execute("select * from spotlight_data")
+        names = [description[0] for description in cursor.description]
+        return names
+        
+    def ReOrderedColumnsQuery(self):
+        columns = self.GetTableColumnNames()[6:]
+        c_query = "CREATE TABLE [spotlight_ordered] ("
+        query = "Full_Path, Inode_Num, Flags, Store_ID, Parent_Inode_Num, Last_Updated, "
+
+        date_columns = "" 
+        name_columns = ""
+        size_columns = ""
+        o_columns = ""
+        
+        for i in columns:
+            if "Date" in i:         # gather all date columns
+                date_columns += "{}, ".format(i)
+                columns.pop(columns.index(i))
+        for i in columns:           # Gather name columns
+            if "FileName" in i or "AlternateNames" in i or "DisplayName" in i:
+                name_columns += "{}, ".format(i)
+                columns.pop(columns.index(i))
+        for i in columns:
+            if "calSize" in i:      # Gather phys and log size columns
+                size_columns += "{}, ".format(i)
+                columns.pop(columns.index(i))
+        
+        other_columns = [
+            'kMDItemExternalID',
+            'kMDItemOwnerGroupID',
+            'kMDItemOwnerUserID',
+            'kMDItemNodeCount',
+            'kMDItemKind',
+            'kMDItemContentType',
+            'kMDItemDescription',
+            'Recipient',
+            'Email',
+            'Phone'
+            ]
+        
+        for i in other_columns:
+            for g in columns:
+                if i in g:
+                    o_columns += "{}, ".format(g)
+                    columns.pop(columns.index(g))
+        
+        query += date_columns + name_columns + size_columns + o_columns
+        
+        for i in columns:
+            query += i + ', '
+        
+        c_query += " [" + query[:-2].replace(", ", "] [TEXT] NULL, [") + "] [TEXT] NULL)"
+        
+        c_query = c_query.replace("[Inode_Num] [TEXT]", "[Inode_Num] [INTEGER]")
+        query = "INSERT INTO spotlight_ordered (" + query[:-2] + ") SELECT " + query[:-2] + " from spotlight_data;"
+        
+        log.info("Executing db column reordering")
+        self.SQLTran.execute(c_query)
+        
+        self.SQLTran.execute(query)
+        
+        self.SQLTran.execute("DROP TABLE spotlight_data")
+        
+        self.SQLTran.execute("ALTER TABLE spotlight_ordered RENAME TO spotlight_data")
+        
+        self.SQLTran.execute("VACUUM")
+
+
 class SpotlightStore:
     def __init__(self, file_pointer):
         self.file = file_pointer
@@ -438,7 +580,7 @@ class SpotlightStore:
         self.indexes_1 = {}
         self.indexes_2 = {}
         self.block0 = None
-
+        
     def GetFileSize(self, file):
         '''Return size from an open file handle'''
         current_pos = file.tell()
@@ -577,8 +719,12 @@ class SpotlightStore:
         if hit and (hit[4] == md_item.date_updated): return True
         return False
 
-    def ParseMetadataBlocks(self, output_file, items, items_to_compare=None, process_items_func=None):
+    def ParseMetadataBlocks(self, output_file, items, sqlite_db, items_to_compare=None, process_items_func=None):
         # Index = [last_id_in_block, offset_index, dest_block_size]
+        db_columns = []
+        db_values = []
+        db_columns_add = ["full_path", "Inode_Num", "Flags", "Store_ID", "Parent_Inode_Num", "Last_Updated"]
+
         for index in self.block0.indexes:
             #go to offset and parse
             self.Seek(index[1] * 0x1000)
@@ -647,7 +793,7 @@ class SpotlightStore:
                                     if existing_item[2] != name:
                                         log.warning("Repeat item has different name, existing={}, new={}".format(existing_item[2], name))
                         else: # Not adding repeat elements
-                            items[md_item.id] = [md_item.id, md_item.parent_id, md_item.GetFileName().decode('utf-8'), None, md_item.date_updated] # id, parent_id, name, path, date
+                            items[md_item.id] = [md_item.id, md_item.parent_id, md_item.GetFileName().decode('utf-8'), '', md_item.date_updated] # id, parent_id, name, path, date
                 except:
                     log.exception('Error trying to process item @ block {:X} offset {}'.format(index[1] * 0x1000 + 20, pos))
                 pos += item_size + 4
@@ -656,8 +802,16 @@ class SpotlightStore:
             if process_items_func:
                 process_items_func(items_in_block)
 
+            db_columns_new = db_columns_add[:]
             for md_item in items_in_block:
-                md_item.Print(output_file)
+                #md_item.Print(output_file, "Y", db_columns, db_values, db_columns_add)
+                (db_columns, db_values, db_columns_new) = md_item.Print(output_file, "Y", db_columns, db_values, db_columns_new)
+                if len(db_columns_add) != len(db_columns_new):
+                    for new_column in db_columns_new:
+                        if new_column not in db_columns_add:
+                            db_columns_add.append(new_column)
+                            sqlite_db.AddColumn("alter table spotlight_data add column " + new_column + " text;", new_column)
+                sqlite_db.InsertValues(", ".join(db_columns), db_values, len(db_columns))
 
     def ParseBlockSequence(self, initial_index, type, dictionary):
         '''Follow the sequence of next_block_index to parse all blocks in the chain'''
@@ -744,37 +898,43 @@ def ProcessStoreDb(input_file_path, output_path, file_name_prefix='store'):
 
     items = {}
     time_processing_started = time.time()
-
-    output_path_full_paths = os.path.join(output_folder, file_name_prefix + '_fullpaths.csv')
+    
+    output_path_full_paths = os.path.join(output_folder, file_name_prefix + '_fullpaths.tsv')
     output_path_data = os.path.join(output_folder, file_name_prefix + '_data.txt')
+    db_path = os.path.join(output_folder, file_name_prefix + '_db.sqlite')
 
     log.info('Processing ' + input_file_path)
     try:
         f = open(input_file_path, 'rb')
-
-        store = SpotlightStore(f)
-        store.ReadBlocksInSeq()
-
         log.info("Creating output file {}".format(output_path_data))
-
         with open(output_path_data, 'wb') as output_file:
-            store.ParseMetadataBlocks(output_file, items, None, None)
+            log.info("Creating output file {}".format(output_path_full_paths))
+            with open (output_path_full_paths, 'wb') as output_paths_file:
+                sqlite_db = SQLiteDb(db_path)
+                store = SpotlightStore(f)
+                store.ReadBlocksInSeq()
+                store.ParseMetadataBlocks(output_file, items, sqlite_db, None, None)
 
-        log.info("Creating output file {}".format(output_path_full_paths))
-
-        with open(output_path_full_paths, 'wb') as output_paths_file:
-            output_paths_file.write("Inode_Number\tFull_Path\r\n".encode('utf-8'))
-            for k, v in items.items():
-                name = v[2]
-                if name:
-                    fullpath = RecursiveGetFullPath(v, items)
-                    to_write = str(k) + '\t' + fullpath + '\r\n'
-                    output_paths_file.write(to_write.encode('utf-8'))
-
+                output_paths_file.write("Inode_Number\tFull_Path\r\n")
+                log.info("Inserting fullpaths into db")
+                for k,v in items.items():
+                    name = v[2]
+                    if name:
+                        fullpath = RecursiveGetFullPath(v, items)
+                        
+                        to_write = str(k) + '\t' + fullpath + '\r\n'
+                        output_paths_file.write(to_write.encode('utf-8'))
+                        query = u"UPDATE spotlight_data SET \"full_path\" = \"{0:s}\" WHERE \"Inode_Num\" = \"{1:s}\"".format(fullpath.replace('"','""'), str(k))
+                        try:
+                            sqlite_db.UpdateFullpaths(query)
+                        except:
+                            log.error('error_with_query', query)
+            sqlite_db.ReOrderedColumnsQuery()
     except Exception as ex:
         log.exception('')
     finally:
         f.close()
+        sqlite_db.Close()
 
     time_processing_ended = time.time()
     run_time = time_processing_ended - time_processing_started
